@@ -1,0 +1,1 @@
+A repo documenting my learning from Claude Code to build my own agent in understanding companies' financial statements. 
