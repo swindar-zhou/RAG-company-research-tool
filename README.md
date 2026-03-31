@@ -112,17 +112,17 @@ document → read_full() → LLM_process() → extract_structured() → cache_sm
 ┌─────────────────────────────────────────────────────────────────┐
 │                      HedgeFundRAG System                        │
 │                                                                 │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────┐ │
-│  │   File State     │  │   Knowledge      │  │  Multi-Model │ │
-│  │   LRU Cache      │  │   Graph          │  │  Support     │ │
-│  │                  │  │                  │  │              │ │
-│  │ • 25MB limit     │  │ • Nodes: Co's    │  │ • Claude     │ │
-│  │ • 100 files      │  │ • Edges: rels    │  │ • GPT-4o     │ │
-│  │ • isPartialView  │  │ • Provenance     │  │ • GPT-mini   │ │
-│  │   flag           │  │ • Queryable      │  │ • GLM/Gemini │ │
-│  └──────────────────┘  └──────────────────┘  └──────────────┘ │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────┐   │
+│  │   File State     │  │   Knowledge      │  │  Multi-Model │   │
+│  │   LRU Cache      │  │   Graph          │  │  Support     │   │
+│  │                  │  │                  │  │              │   │
+│  │ • 25MB limit     │  │ • Nodes          │  │ • Claude     │   │
+│  │ • 100 files      │  │ • Edges          │  │ • GPT-4o     │   │
+│  │ • isPartialView  │  │ • Provenance     │  │ • GPT-mini   │   │
+│  │   flag           │  │ • Queryable      │  │ • GLM/Gemini │   │
+│  └──────────────────┘  └──────────────────┘  └──────────────┘   │
 │                                                                 │
-│  Flow: PDF → Read Full → Extract Structured → Graph → Cache    │
+│  Flow: PDF → Read Full → Extract Structured → Graph → Cache     │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
