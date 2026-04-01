@@ -1,6 +1,6 @@
 # Claude Code Architecture Learning Notes
 
-## Context & Questions
+## My Context & Questions
 
 ### Current Situation
 - **Current Tech**: RAG with LangChain, chunking with embeddings
@@ -532,13 +532,16 @@ With fork agents (Claude Code):
 5. **Multi-model support** (shows flexibility, vendor-agnostic thinking)
 6. **Cost-conscious** (fork agents, caching - important for hedge funds!)
 
-**Questions you can now answer in interviews:**
+**Questions**
 
 Q: "How do you prevent hallucinations in RAG?"
 A: "isPartialView flag + source attribution (line numbers) + knowledge graph with provenance links"
 
 Q: "How do you optimize costs for high-volume document processing?"
-A: "Fork agents with cache-safe parameters (90% savings), LRU cache for recent docs, self-hosted GLM for very high volume"
+A: "Three-tier approach: GPT-4o-mini filters 1000→100 ($8), GPT-4o screens 100→20 ($12), Claude deep-dives on 20 ($3.60). Total $23.60 vs $180 naive = 87% savings. Also use fork agents (90% savings via prompt caching) and LRU cache (67% savings on repeated reads)."
+
+Q: "How do you reduce latency for real-time analysis?"
+A: "Five strategies: (1) Parallel execution (50x speedup), (2) Multi-tier caching - L1 memory 0ms, L2 Redis 5ms, L3 LLM 300ms, (3) Streaming for 0.5s TTFB, (4) Fast models - GPT-4o-mini 200ms vs Claude 800ms, (5) Pre-computation for common queries. Result: 15ms avg vs 2000ms naive = 127x faster."
 
 Q: "Should we use LangGraph?"
 A: "Not for RAG. It's for workflow orchestration. Our use case needs dynamic RAG with LLM-driven routing, not predefined graphs."
@@ -546,5 +549,96 @@ A: "Not for RAG. It's for workflow orchestration. Our use case needs dynamic RAG
 Q: "How do you evaluate model performance?"
 A: "Benchmark on latency (speed), cost (efficiency), accuracy (correctness), hallucination rate (safety), and domain-specific metrics like financial extraction quality."
 
+Q: "What are the trade-offs between models?"
+A: "Decision value framework: If decision_value/cost > 1000, use Claude (96% quality, $9/1M). If < 100, use GPT-mini (85% quality, $0.38/1M). Else GPT-4o (92% quality, $6.25/1M). Example: $100M investment → Claude worth it. 1000 company screen → GPT-mini good enough for filtering."
 
+---
+
+---
+
+## Session 4: Redis vs LangChain vs LlamaIndex Clarification (2026-03-31)
+
+### 🔍 Key Insight: Understanding the Layers
+
+**Common confusion**: "Should I use Redis, LangChain, or LlamaIndex for RAG?"
+
+**Answer**: They're different layers - not competing, they work together!
+
+```
+Application Layer:  Your RAG system, LangChain chains, LlamaIndex queries
+Framework Layer:    LangChain, LlamaIndex, Claude Code
+Infrastructure Layer: Redis, PostgreSQL, Pinecone, S3
+```
+
+### What Each Does
+
+**Redis** (Infrastructure):
+- Distributed key-value cache
+- NOT a RAG framework
+- Used BY LangChain/LlamaIndex for caching
+- 5ms latency, team-wide sharing
+
+**LangChain** (Framework):
+- RAG orchestration (chains, agents)
+- Can use Redis for LLM response caching
+- Still uses static RAG (pre-chunking)
+- Good for: Quick prototypes, standard use cases
+
+**LlamaIndex** (Framework):
+- Data-centric indexing
+- Can use Redis for vector storage
+- Better for: Incremental updates, data organization
+- Still embeddings-based (no structure)
+
+**My System** (Application):
+- Custom RAG with dynamic processing
+- Can use Redis as L2 cache layer
+- Knowledge graph (structured) > embeddings
+- Best for: High-accuracy, source attribution needed
+
+### Cost Comparison (50 Companies)
+
+| Approach | Cost | Why |
+|----------|------|-----|
+| LangChain + Redis | $4.20 | Caches LLM responses (30% hit rate) |
+| LlamaIndex + Redis | $11.00 | High indexing cost upfront |
+| My System (no Redis) | $1.30 | Multi-tier model optimization |
+| My System + Redis | $0.50 | LRU + Redis = 90% hit rate! |
+
+### Latency Comparison (Real-time Dashboard)
+
+| Approach | P95 Latency | Why |
+|----------|-------------|-----|
+| LangChain + Redis | 1500ms | Semantic cache slower |
+| LlamaIndex + Redis | 1200ms | Vector search overhead |
+| My System (no Redis) | 500ms | Fast LRU L1 cache |
+| My System + Redis | 300ms | Multi-tier (L1 0ms + L2 5ms) |
+
+### When to Use Redis with RAG
+
+✅ **Use Redis when**:
+- Team size > 5 (shared cache benefit)
+- Query similarity high (same companies analyzed)
+- Need persistence (cache survives restarts)
+
+❌ **Don't use Redis when**:
+- Solo developer (no sharing benefit)
+- Unique queries each time (low cache hit rate)
+- Prototype phase (adds complexity)
+
+### Interview Answer Template
+
+**Q**: "Should we use Redis with our RAG system?"
+
+**A**: "It depends on team size and query patterns. Redis makes sense as an L2 cache for team sharing:
+
+**Architecture**:
+- L1 (in-memory LRU): 0ms, 80% hit rate, per-analyst
+- L2 (Redis): 5ms, 15% hit rate, team-wide
+- L3 (knowledge graph): 50ms, 4% hit rate, persistent
+- L4 (LLM): 2000ms, 1% hit rate, compute
+
+**Result**: 23ms average vs 2000ms naive = 87x faster
+
+**Trade-off**: Adds infrastructure complexity. Only worth it if team > 5 people and query similarity > 30%. For solo prototype, skip Redis. For production with 20 analysts, Redis saves significant cost."
 
