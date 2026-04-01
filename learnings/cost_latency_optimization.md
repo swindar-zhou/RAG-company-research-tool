@@ -1,983 +1,376 @@
-# Cost Savings & Latency Reduction - Deep Dive
+# Cost & Latency Optimization — Design Analysis
+
+> **Status note**: This document describes the architectural reasoning and calculated estimates behind the system's cost and latency design. Numbers are derived from published API pricing and assumed workload patterns — **not measured from running real SEC filings through the pipeline**. Where something is implemented vs designed is called out explicitly.
+
+---
 
 ## Why This Matters for Hedge Funds
 
-**Scenario**: PM asks you to screen 50 biotech companies for FDA pipeline risk by EOD.
+**Scenario**: A PM asks you to screen 50 biotech companies for FDA pipeline risk before end of day.
 
-**Without optimization:**
-- Cost: $500 (each company = $10)
-- Time: 2.5 hours (50 × 3 min/company)
-- **Result**: Too slow and expensive to be useful
+The naive approach — send every document to the best model, one at a time — has two problems:
 
-**With optimization:**
-- Cost: $25 (95% reduction!)
-- Time: 15 minutes (97% reduction!)
-- **Result**: Actionable insights before lunch
+1. **Cost spiral**: each company costs roughly the same, and there's no intelligence about which ones deserve deep analysis
+2. **Latency ceiling**: sequential processing means the wall-clock time grows linearly with company count
 
-Let's understand HOW to achieve this.
+The architecture here addresses both by making two design choices: route documents to cheaper models when precision isn't critical, and process independent analyses in parallel.
+
+Neither of these is novel. The value is in showing you understand *why* they work and *when* they break down.
 
 ---
 
-## Part 1: Cost Savings Mechanisms
+## Part 1: Cost Savings
 
-### 1.1 Prompt Caching (The Big Win!)
+### 1.1 Prompt Caching — The Mechanism
 
-**How Claude API Caching Works:**
+Claude's API caches the beginning of a request. If the first N tokens sent to the API are byte-identical to a previous request within a cache window (~5 minutes), those tokens are charged at the cache read rate instead of the full input rate.
 
-Claude caches the **beginning** of your prompt. If multiple requests share the same prefix, you only pay once.
-
-**Example without caching:**
+**Anthropic's published rates (March 2026):**
 ```
-Request 1 (AAPL analysis):
-  System: "You are a hedge fund analyst specializing in..." [2000 tokens]
-  User: "Analyze AAPL" [5 tokens]
-  Cost: 2005 tokens × $3/1M = $0.006015
-
-Request 2 (MSFT analysis):
-  System: "You are a hedge fund analyst specializing in..." [2000 tokens]
-  User: "Analyze MSFT" [5 tokens]
-  Cost: 2005 tokens × $3/1M = $0.006015
-
-50 companies: 50 × $0.006 = $0.30
+Full input:   $3.00 / 1M tokens
+Cache write:  $3.75 / 1M tokens  (slightly more expensive — you pay to store)
+Cache read:   $0.30 / 1M tokens  (10x cheaper than full input)
 ```
 
-**With caching:**
+**Calculated estimate for 50-company analysis:**
 ```
-Request 1 (AAPL):
-  System: [2000 tokens] - CACHE MISS
-  Cost: 2005 tokens × $3/1M = $0.006015
+System prompt: ~2000 tokens
 
-Request 2 (MSFT):
-  System: [2000 tokens] - CACHE HIT! (only pay $0.30/1M for cached)
-  New: [5 tokens]
-  Cost: (2000 × $0.30/1M) + (5 × $3/1M) = $0.00060 + $0.000015 = $0.000615
+Without caching:
+  50 companies × (2000 tokens × $3/1M) = $0.30
 
-50 companies: $0.006 + (49 × $0.0006) = $0.0354
+With caching:
+  Call 1 (cache miss):  2000 × $3.75/1M = $0.0075
+  Calls 2–50 (hits):    49 × (2000 × $0.30/1M) = $0.0294
+  Total: ~$0.037
 
-Savings: $0.30 → $0.035 = 88% reduction!
+Estimated savings: ~88%
 ```
 
-**Key insight**: The more repetitive your prompts, the bigger the savings!
+**What breaks this:**
+- Any dynamic content in the prompt (timestamps, session IDs, random values)
+- GrowthBook or feature flag values changing between calls
+- Prompt rendered differently per-call (even whitespace differences bust the cache)
+
+The `forkedAgent.ts` pattern in Claude Code exists precisely to prevent these cache misses — by having the parent render the prompt once and passing the already-rendered bytes to children.
 
 ---
 
-### 1.2 Fork Agents (Claude Code's Innovation)
+### 1.2 Fork Agents — Designed, Not Yet Implemented
 
-**The Problem:**
-When you spawn a new agent, you need to re-send the system prompt. But if each agent renders the prompt slightly differently (timestamps, random IDs, etc.), cache misses!
+**Pattern (from `src/utils/forkedAgent.ts` in Claude Code):**
 
-**Claude Code's Solution: Cache-Safe Parameters**
-
-From `forkedAgent.ts`:
 ```typescript
 type CacheSafeParams = {
-  systemPrompt: SystemPrompt,  // Byte-exact copy from parent
-  userContext: { ... },
-  systemContext: { ... },
-  toolUseContext: { ... }
+  systemPrompt: SystemPrompt,    // Already rendered — byte-exact
+  userContext: { [k: string]: string },
+  systemContext: { [k: string]: string },
+  toolUseContext: ToolUseContext,
+  forkContextMessages: Message[],
 }
 ```
 
-**How it works:**
+The parent agent renders the system prompt once. Each child inherits the exact same bytes, guaranteeing a cache hit on every child API call.
 
+**Calculated estimate:**
 ```
-┌─────────────────────────────────────────────┐
-│ Parent Agent (Main)                         │
-│                                             │
-│ System Prompt: [Rendered ONCE]             │
-│ "You are a hedge fund analyst..."           │
-│ [2000 tokens]                               │
-│                                             │
-│ Cost: $0.006 (cache miss on first call)    │
-└─────────────────────────────────────────────┘
-           │
-           ├── Fork Child 1 (AAPL)
-           │   ↓
-           │   Inherits: EXACT byte-for-byte prompt
-           │   New: "Analyze AAPL 10-K"
-           │   Cost: $0.0006 (cache hit!)
-           │
-           ├── Fork Child 2 (MSFT)
-           │   ↓
-           │   Inherits: EXACT same prompt
-           │   New: "Analyze MSFT 10-K"
-           │   Cost: $0.0006 (cache hit!)
-           │
-           └── Fork Child 3 (GOOGL)
-               ↓
-               Cost: $0.0006 (cache hit!)
+Parent (cache miss):     $0.006
+Child 1–50 (cache hit):  50 × $0.0006 = $0.030
+Total: $0.036
 
-Total: $0.006 + (3 × $0.0006) = $0.0078
+vs naive (re-render each time): ~$0.30
+Estimated savings: ~88%
 ```
 
-**Why "byte-exact" matters:**
-
-```python
-# BAD: Each child re-renders prompt (cache miss!)
-for company in companies:
-    prompt = f"You are an analyst. Today is {datetime.now()}..."
-    # ❌ Timestamp changes! Cache miss every time!
-
-# GOOD: Parent renders once, children inherit
-parent_prompt = render_once("You are an analyst...")
-for company in companies:
-    spawn_fork_child(
-        inherited_prompt=parent_prompt,  # ✅ Byte-exact match!
-        new_task=f"Analyze {company}"
-    )
-```
+**Status:** This pattern is documented and understood, but `ForkedAnalysis` is not yet wired into `HedgeFundRAG`. Implementing it requires:
+1. Separating system prompt rendering from per-company task generation
+2. Passing rendered prompt bytes to parallel `asyncio.gather()` tasks
+3. Verifying cache hit rates via API response headers (`x-cache`)
 
 ---
 
-### 1.3 Model Selection (Right Tool for Right Job)
+### 1.3 Tiered Model Selection — Implemented in ModelRouter
 
-**Cost comparison (per 1M tokens):**
+**Principle:** Use cheaper, faster models to discard irrelevant candidates. Apply expensive models only to what survives.
 
-| Model | Input | Output | Avg* | Speed |
-|-------|-------|--------|------|-------|
-| Claude Sonnet 4.5 | $3.00 | $15.00 | $9.00 | 800ms |
-| GPT-4o | $2.50 | $10.00 | $6.25 | 400ms |
-| GPT-4o-mini | $0.15 | $0.60 | $0.38 | 200ms |
-| Gemini 1.5 Pro | $1.25 | $5.00 | $3.13 | 600ms |
-| GLM-4 (self-hosted) | $0 | $0 | $0** | 500ms |
+**Published pricing (March 2026):**
 
-*Avg = (Input + Output) / 2 for estimation
-**GPU cost instead: AWS p3.2xlarge = $3.06/hour ≈ $0.001/second
+| Model | Input | Output | Notes |
+|---|---|---|---|
+| `claude-sonnet-4-20250514` | $3/1M | $15/1M | Highest quality |
+| `gpt-4o` | $2.50/1M | $10/1M | Good balance |
+| `gpt-4o-mini` | $0.15/1M | $0.60/1M | Fast, cheap |
+| `gemini-1.5-pro` | $1.25/1M | $5/1M | Cost-effective |
+| GLM-4 (self-hosted) | $0 API | $0 API | GPU compute cost instead |
 
-**Strategic model selection:**
+**Calculated example — 1000 companies:**
 
-```python
-class SmartRAG:
-    def analyze_company(self, company, priority):
-        if priority == "high_stakes":
-            # Investment memo for PM
-            model = "claude"  # Best quality, worth $9/1M
-
-        elif priority == "screening":
-            # Initial pass on 50 companies
-            model = "gpt-4o-mini"  # 24x cheaper than Claude!
-
-        elif priority == "bulk":
-            # Screen 500+ companies daily
-            model = "glm_selfhosted"  # $0 API cost
-
-        return self.extract(company, model=model)
-```
-
-**Real example:**
+Assumptions: each analysis prompt ~50k input tokens, ~500 output tokens.
 
 ```
-Task: Screen 50 companies, deep-dive on top 5
+Per-analysis cost estimates:
+  GPT-4o-mini: (50k × $0.15 + 0.5k × $0.60) / 1M ≈ $0.0075 + $0.0003 = $0.008
+  GPT-4o:      (50k × $2.50 + 0.5k × $10.00) / 1M ≈ $0.125  + $0.005  = $0.13
+  Claude:      (50k × $3.00 + 0.5k × $15.00) / 1M ≈ $0.150  + $0.0075 = $0.158
 
-Without optimization:
-  All with Claude: 50 × $0.18 = $9.00
+Three-tier pipeline:
+  Tier 1 — GPT-4o-mini, 1000 companies: 1000 × $0.008 = $8.00
+  Tier 2 — GPT-4o, top 100:             100  × $0.13  = $13.00
+  Tier 3 — Claude, top 20:              20   × $0.158 = $3.16
 
-With optimization:
-  Initial screen (GPT-4o-mini): 50 × $0.008 = $0.40
-  Deep dive (Claude): 5 × $0.18 = $0.90
-  Total: $1.30
+  Total: ~$24.16
+  vs all-Claude: 1000 × $0.158 = $158
 
-Savings: $9.00 → $1.30 = 86% reduction!
-Quality: Still excellent on the 5 that matter!
+Estimated savings: ~85%
 ```
+
+**Key assumption:** The filter stage achieves ≥95% recall (doesn't miss good candidates). If recall is lower, you're not saving money — you're losing signal. This is the real design risk and needs to be measured, not assumed.
 
 ---
 
-### 1.4 Token Efficiency (Compaction)
+### 1.4 LRU Cache — Implemented
 
-**The Problem: Context Window Bloat**
+**What exists:** `FileStateCache` in `rag_implementation.py` — 100 entries, 25MB total, LRU eviction, `isPartialView` tracking.
 
+**Calculated savings on repeated reads:**
 ```
-Turn 1: Read 10-K (50k tokens)
-Turn 2: Extract revenue (60k tokens total)
-Turn 3: Extract margins (70k tokens total)
-...
-Turn 50: Context full! (200k tokens)
-```
+A 10-K PDF ≈ 100 pages × ~500 tokens/page = ~50k tokens
+Cost to process: 50k × $3/1M = $0.15
 
-**Cost impact:**
-```
-Without compaction:
-  Turn 1: 50k tokens = $0.15
-  Turn 2: 60k tokens = $0.18
-  Turn 3: 70k tokens = $0.21
-  ...
-  Turn 50: 200k tokens = $0.60
+Without cache (3 reads in a session):  3 × $0.15 = $0.45
+With LRU cache (1 miss + 2 hits):      1 × $0.15 = $0.15
 
-  Total: ~$15.00 for one conversation!
+Savings: 67% over 3 reads
 ```
 
-**Claude Code's solution: Auto-Compaction**
-
-From `autoCompact.ts:75-90`:
-```typescript
-const autocompactThreshold = effectiveContextWindow - AUTOCOMPACT_BUFFER_TOKENS
-
-if (tokenUsage > autocompactThreshold) {
-  // Summarize old messages aggressively
-  compactedMessages = await summarizeOldContext(messages)
-}
-```
-
-**How it works:**
-
-```
-Turn 1-30: Detailed messages (150k tokens)
-   ↓
-[Auto-compact triggered at 80% threshold]
-   ↓
-Summarized: "Previous analysis covered AAPL revenue trends..." (5k tokens)
-   ↓
-Turn 31-60: Fresh context space!
-```
-
-**Cost impact:**
-```
-With compaction:
-  Turn 1-30: Build up to 160k tokens = $4.80
-  [Compact to 10k tokens]
-  Turn 31-60: Build up to 160k tokens = $4.80
-  [Compact to 10k tokens]
-
-  Total: ~$10.00 (33% savings)
-  Plus: Can continue indefinitely!
-```
+This is straightforward to verify once real PDFs are processed. The math here is reliable since token count per document is measurable.
 
 ---
 
-### 1.5 LRU Cache (Avoid Re-reading Files)
+## Part 2: Latency Reduction
 
-**The Problem:**
+### 2.1 Parallel Execution — Designed, Not Yet Wired
 
-```
-Turn 5: "What's AAPL's revenue?"
-  → Read 10-K (50k tokens = $0.15)
-
-Turn 25: "Remind me of AAPL's revenue?"
-  → Read 10-K AGAIN (50k tokens = $0.15)
-
-Turn 45: "Compare AAPL revenue to earlier..."
-  → Read 10-K AGAIN (50k tokens = $0.15)
-
-Wasted: $0.30 on redundant reads!
-```
-
-**Solution: LRU Cache**
-
-From `fileStateCache.ts:17-22`:
-```typescript
-export const READ_FILE_STATE_CACHE_SIZE = 100
-const DEFAULT_MAX_CACHE_SIZE_BYTES = 25 * 1024 * 1024  // 25MB
-```
-
-**How it saves money:**
-
+**Pattern:**
 ```python
-class HedgeFundRAG:
-    def __init__(self):
-        self.cache = FileStateCache(100, 25)  # 100 files, 25MB
-
-    def get_revenue(self, company):
-        pdf_path = f"{company}_10k.pdf"
-
-        # Check cache first (FREE!)
-        if self.cache.has(pdf_path):
-            cached = self.cache.get(pdf_path)
-            if not cached.isPartialView:
-                return cached.content  # $0 cost!
-
-        # Cache miss: read from disk (costs tokens)
-        content = read_pdf(pdf_path)  # $0.15
-        self.cache.set(pdf_path, content)
-        return content
-```
-
-**Cost impact:**
-
-```
-Without cache:
-  Turn 5: Read AAPL 10-K = $0.15
-  Turn 25: Read AAPL 10-K = $0.15
-  Turn 45: Read AAPL 10-K = $0.15
-  Total: $0.45
-
-With cache:
-  Turn 5: Read AAPL 10-K = $0.15 (cache miss)
-  Turn 25: Get from cache = $0.00 (cache hit!)
-  Turn 45: Get from cache = $0.00 (cache hit!)
-  Total: $0.15
-
-Savings: 67% on repeated reads!
-```
-
----
-
-## Part 2: Latency Reduction Techniques
-
-### 2.1 Parallel Execution (The Biggest Win!)
-
-**Sequential (slow):**
-```python
-results = []
-for company in companies:
-    result = analyze(company)  # 3 minutes each
-    results.append(result)
-
-# Total: 50 × 3 min = 150 minutes (2.5 hours!)
-```
-
-**Parallel (fast):**
-```python
-import asyncio
-
-async def analyze_all(companies):
-    tasks = [analyze_async(company) for company in companies]
-    results = await asyncio.gather(*tasks)
+async def analyze_portfolio(self, tickers: List[str]) -> List[Dict]:
+    tasks = [self.analyze_10k_async(ticker) for ticker in tickers]
+    # Process in batches to respect API rate limits
+    results = []
+    for i in range(0, len(tasks), 10):  # 10 concurrent max
+        batch_results = await asyncio.gather(*tasks[i:i+10])
+        results.extend(batch_results)
     return results
-
-# Total: max(3 min) = 3 minutes!
-# Speedup: 50x faster!
 ```
 
-**Why this works:**
-
+**Theoretical speedup:**
 ```
-Sequential:
-[Company 1] → [Company 2] → [Company 3] → ...
-   3 min        3 min        3 min
+Sequential — 50 companies, 3 min each:
+  50 × 3 = 150 min
 
-Parallel:
-[Company 1]
-[Company 2]  ← All running simultaneously
-[Company 3]
-[Company 4]
-...
-[Company 50]
-   ↓
-All finish in ~3 minutes (limited by slowest one)
+Batched parallel — 10 concurrent:
+  5 batches × 3 min = 15 min
+  Speedup: 10x
+
+Unlimited parallel (ceiling):
+  max(3 min) = 3 min
+  Speedup: 50x
 ```
 
-**Real implementation:**
-
-```python
-class HedgeFundRAG:
-    async def analyze_portfolio(self, tickers: List[str]):
-        # Create tasks
-        tasks = [
-            self.analyze_10k_async(ticker)
-            for ticker in tickers
-        ]
-
-        # Execute in parallel (up to 10 concurrent to avoid rate limits)
-        results = []
-        for i in range(0, len(tasks), 10):
-            batch = tasks[i:i+10]
-            batch_results = await asyncio.gather(*batch)
-            results.extend(batch_results)
-
-        return results
-
-# Usage
-rag = HedgeFundRAG()
-results = await rag.analyze_portfolio([
-    "AAPL", "MSFT", "GOOGL", ...  # 50 companies
-])
-
-# Time: ~15 minutes (5 batches × 3 min/batch)
-# vs Sequential: 150 minutes
-# Speedup: 10x faster!
-```
+**Realistic ceiling:** API rate limits and token-per-minute caps will constrain throughput. The actual speedup depends on your Anthropic tier. Batch size of 10 is a conservative starting point.
 
 ---
 
-### 2.2 Streaming (Perceived Latency)
+### 2.2 Streaming — Not Yet Implemented
 
-**Without streaming (feels slow):**
-```
-User: "Analyze AAPL"
-  [Wait 30 seconds...]
-  [Wait 30 seconds...]
-  [Wait 30 seconds...]
-Assistant: "Here's the full analysis..." [90 seconds later]
+Streaming doesn't reduce actual latency — it reduces *perceived* latency by delivering the first tokens to the user sooner.
 
-Perceived latency: 90 seconds of silence!
-```
-
-**With streaming (feels fast):**
-```
-User: "Analyze AAPL"
-  [0.5s] Assistant: "Analyzing AAPL 10-K..."
-  [1.0s] Assistant: "Revenue for 2024 was..."
-  [2.0s] Assistant: "Operating margins improved..."
-  [3.0s] Assistant: "Key risks include..."
-  ...
-
-Perceived latency: 0.5 seconds to first response!
-Actual latency: Still 90 seconds, but user sees progress
-```
-
-**Implementation:**
-
+**How to add it:**
 ```python
-async def analyze_with_streaming(self, pdf_path):
-    # Start streaming immediately
-    yield "Reading 10-K filing..."
-
-    content = await self.read_pdf_async(pdf_path)
-    yield f"Processing {len(content)} pages..."
-
-    # Stream extraction results as they come
-    async for chunk in self.extract_streaming(content):
-        yield chunk
-
-    yield "Analysis complete!"
-
-# Usage
-async for update in rag.analyze_with_streaming("aapl_10k.pdf"):
-    print(update)  # User sees progress in real-time
+async def analyze_with_streaming(self, pdf_path: str):
+    async with client.messages.stream(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1024,
+        messages=[...]
+    ) as stream:
+        async for text in stream.text_stream:
+            yield text  # caller sees tokens as they arrive
 ```
 
-**Latency impact:**
+**Effect:**
+- Without streaming: user waits ~30–90s seeing nothing
+- With streaming: user sees first token in ~0.5s, full response still takes ~30–90s
 
-```
-Without streaming:
-  Time to first byte (TTFB): 90 seconds
-  User experience: "Is this thing working?"
-
-With streaming:
-  TTFB: 0.5 seconds
-  User experience: "Great, it's working!"
-
-Perceived speedup: 180x faster!
-```
+Worth implementing; estimated ~1 day of work to add to the existing wrappers.
 
 ---
 
-### 2.3 Model Selection (Speed vs Quality)
+### 2.3 Multi-Tier Cache — L1 Implemented, L2/L3 Designed
 
-**Latency benchmarks (for same task):**
+**What's built:** In-memory LRU (L1) via `FileStateCache`.
 
-| Model | Latency | Quality | Use Case |
-|-------|---------|---------|----------|
-| GPT-4o-mini | 200ms | 85% | Real-time screening |
-| GPT-4o | 400ms | 92% | Production balance |
-| Gemini 1.5 Pro | 600ms | 90% | Cost-sensitive |
-| Claude Sonnet 4.5 | 800ms | 96% | High-stakes analysis |
+**What's designed but not built:**
+- L2: Redis for team-wide sharing across analyst sessions
+- L3: PostgreSQL for persistent knowledge graph storage
 
-**Strategic model choice:**
-
-```python
-class SmartRAG:
-    def analyze(self, company, deadline_minutes):
-        if deadline_minutes < 5:
-            # Need results NOW
-            model = "gpt-4o-mini"  # 200ms latency
-            # Trade-off: 85% quality, but 4x faster
-
-        elif deadline_minutes < 30:
-            # Balanced deadline
-            model = "gpt-4o"  # 400ms latency
-            # Trade-off: 92% quality, good speed
-
-        else:
-            # Quality over speed
-            model = "claude"  # 800ms latency
-            # Trade-off: 96% quality, worth the wait
-
-        return self.extract(company, model=model)
-```
-
-**Real example:**
+**Theoretical latency breakdown (assumed hit rates, not measured):**
 
 ```
-Scenario: PM asks "Quick thoughts on AAPL?" during meeting
+L1 in-memory:  ~0ms    — assumed 80% hit rate (same session, same files)
+L2 Redis:      ~5ms    — assumed 15% hit rate (team sharing, prev sessions)
+L3 PostgreSQL: ~50ms   — assumed 4%  hit rate (structured KG queries)
+L4 LLM call:  ~2000ms  — assumed 1%  hit rate (truly new queries)
+
+Weighted average:
+  0.80×0 + 0.15×5 + 0.04×50 + 0.01×2000
+  = 0 + 0.75 + 2 + 20
+  = ~23ms
+
+vs naive (always LLM): ~2000ms
+Theoretical speedup: ~87x
+```
+
+**The 80/15/4/1% split is an assumption.** In practice, hit rates depend heavily on query distribution. A team where every analyst asks about different companies will see much lower L2 hit rates than a team focused on the same sector.
+
+---
+
+### 2.4 Model Latency — Published / Community Benchmarks
+
+These figures are approximate, from public sources and community testing. Not measured from this code:
+
+```
+GPT-4o-mini:  ~200ms   (time-to-first-token, typical)
+GPT-4o:       ~400ms
+Gemini 1.5:   ~600ms
+Claude Sonnet: ~800ms
+
+Ratio (Claude → GPT-mini): ~4x
+```
+
+Latency varies significantly with load, region, request size, and streaming vs non-streaming. Treat these as order-of-magnitude references.
+
+---
+
+## Part 3: Trade-Off Framework
+
+### Cost vs Quality
+
+The right model isn't the best model — it's the cheapest model that's accurate enough for the decision being made.
+
+**Heuristic:**
+```
+Quality threshold for filtering:
+  85% recall (GPT-4o-mini) is acceptable if:
+  - False negatives get caught in a downstream stage
+  - The cost savings justify the occasional missed candidate
+
+Quality threshold for finals:
+  96% accuracy (Claude) is required if:
+  - This is the last step before a decision
+  - The cost of a wrong answer >> cost of the API call
+```
+
+**Example calculation:**
+```
+$100M investment decision, Claude at $0.18/analysis:
+  Cost of error (approx): $100M × some probability
+  Cost of model upgrade: $0.18 → $0.18 (already using best)
+  → Quality is paramount, model cost irrelevant
+
+Screening 1000 companies, GPT-mini at $0.008/analysis:
+  Total screen cost: $8
+  If 5% false negatives at filter stage: miss ~50 companies
+  If screening threshold is conservative, these get caught later
+  → GPT-mini acceptable
+```
+
+### Dynamic RAG vs Static RAG
+
+**The core design choice:**
+
+Static (LangChain default): pre-chunk at ingest time, retrieve top-k chunks at query time.
+
+Dynamic (this system): read full document, let LLM extract structure, cache the result.
+
+**Trade-off:**
+```
+Static RAG:
+  ✅ Scales to millions of documents (pre-indexed)
+  ✅ Fast retrieval (vector similarity search)
+  ❌ Loses relationships that span chunk boundaries
+  ❌ No source attribution at line level
+
+Dynamic RAG:
+  ✅ Preserves semantic completeness
+  ✅ Line-level attribution possible
+  ❌ Higher per-document cost (read full doc each time)
+  ❌ Doesn't scale beyond ~1000 docs without optimization
+```
+
+**For hedge fund use case:** corpus is small (<1000 filings per analyst), quality is critical, and the cost-per-document is justified. Dynamic RAG is the right choice here.
+
+---
+
+## Example Scenarios (Calculated, Not Measured)
+
+### Scenario A: 50 Biotech Companies, FDA Pipeline Screen
+
+```
+Assumptions:
+- Each 10-K: ~100 pages, ~50k tokens
+- 3 minutes per analysis (sequential)
+- GPT-4o-mini for filter, Claude for finals
 
 Without optimization:
-  Use Claude (best quality)
-  Wait: 90 seconds
-  PM: "Never mind, meeting moved on..."
+  Cost: 50 × $0.158 = $7.90
+  Time: 50 × 3 min = 150 min
 
-With optimization:
-  Use GPT-4o-mini (fast)
-  Wait: 15 seconds
-  PM: "Great, thanks!"
+Two-stage with parallelism:
+  Filter (GPT-mini, 10 concurrent): $0.40, ~15 min
+  Deep-dive (Claude, 5 concurrent on top 10): $1.58, ~6 min
+  Total: ~$1.98, ~21 min
 
-Trade-off: 96% → 85% quality
-Benefit: Actually useful! (speed matters)
+Estimated savings:
+  Cost: ~75% ($7.90 → $1.98)
+  Time: ~86% (150 min → 21 min)
 ```
+
+These numbers depend heavily on the assumed token counts and parallelism. Real numbers will differ.
 
 ---
 
-### 2.4 Caching (Latency + Cost)
-
-**Cache hierarchy (fastest to slowest):**
+### Scenario B: Real-Time Dashboard, 20 Companies
 
 ```
-1. In-memory cache (LRU)     → 0ms    | $0
-2. Redis (shared team cache) → 5ms    | ~$0.001
-3. Database (PostgreSQL)     → 50ms   | ~$0.01
-4. Re-compute with LLM       → 2000ms | $0.15
+Assumptions:
+- 80% of queries hit L1 cache (same session)
+- 15% hit Redis L2 (team cache, prev sessions)
+- 5% need LLM call (truly new queries)
+- LLM calls use GPT-4o-mini (200ms) not Claude (800ms)
+
+Weighted latency:
+  0.80 × 0ms + 0.15 × 5ms + 0.05 × 200ms
+  = 0 + 0.75 + 10
+  = ~11ms average
+
+vs naive (always LLM, Claude):
+  2000ms average
+
+Theoretical speedup: ~180x
 ```
 
-**Smart caching strategy:**
-
-```python
-class MultiTierCache:
-    def get_revenue(self, ticker):
-        # L1: In-memory (fastest)
-        if ticker in self.memory_cache:
-            return self.memory_cache[ticker]  # 0ms
-
-        # L2: Redis (fast)
-        if redis.exists(ticker):
-            result = redis.get(ticker)  # 5ms
-            self.memory_cache[ticker] = result
-            return result
-
-        # L3: Database (slow)
-        result = db.query(ticker)  # 50ms
-        if result:
-            redis.set(ticker, result, expire=3600)
-            self.memory_cache[ticker] = result
-            return result
-
-        # L4: Compute (slowest)
-        result = self.analyze_with_llm(ticker)  # 2000ms
-        db.save(ticker, result)
-        redis.set(ticker, result, expire=3600)
-        self.memory_cache[ticker] = result
-        return result
-```
-
-**Latency impact:**
-
-```
-First request (AAPL):
-  L1 miss → L2 miss → L3 miss → L4 compute
-  Latency: 2000ms
-
-Second request (AAPL, same session):
-  L1 hit!
-  Latency: 0ms
-  Speedup: ∞ (instant!)
-
-Third request (AAPL, new session):
-  L1 miss → L2 hit
-  Latency: 5ms
-  Speedup: 400x faster!
-```
+Reality check: the 80% L1 hit rate only holds if users repeatedly query the same companies. First session of the day sees 0% L1 hits and depends entirely on L2 and L3.
 
 ---
 
-## Part 3: Trade-Offs Framework
+## What Would Make These Numbers Real
 
-### 3.1 Cost vs Quality
+To validate these estimates against actual workloads:
 
-**The Spectrum:**
+1. **Download 10 real 10-Ks from SEC EDGAR** (freely available, no account needed)
+2. **Process them through `HedgeFundRAG.analyze_10k()`** and record actual token counts from API responses
+3. **Compare extracted financials against XBRL data** (machine-readable structured data that SEC mandates alongside 10-Ks — exact ground truth)
+4. **Measure actual LLM latency** from the `BenchmarkResult.latency_ms` field
+5. **Count cache hits/misses** by logging `FileStateCache.get()` calls
 
-```
-Low Cost ←────────────────────→ High Cost
-Low Quality                   High Quality
-
-GLM          GPT-4o-mini    GPT-4o      Claude
-(self-hosted)
-$0 API       $0.38/1M       $6.25/1M    $9.00/1M
-75% quality  85% quality    92% quality 96% quality
-```
-
-**Decision framework:**
-
-```python
-def choose_model(task_importance, budget_constraint):
-    if task_importance == "critical":
-        # Investment memo for $100M decision
-        # Cost: $0.18 per analysis
-        # Trade-off: Worth it! 96% quality matters
-        return "claude"
-
-    elif task_importance == "high":
-        # Due diligence for potential investments
-        # Cost: $0.12 per analysis
-        # Trade-off: Good balance (92% quality)
-        return "gpt-4o"
-
-    elif task_importance == "screening":
-        # Initial pass, just need basic numbers
-        # Cost: $0.008 per analysis
-        # Trade-off: 85% good enough for filtering
-        return "gpt-4o-mini"
-
-    elif budget_constraint == "very_tight":
-        # Analyzing 10,000 companies
-        # Cost: $0 API (just GPU)
-        # Trade-off: 75% quality, but volume matters
-        return "glm_selfhosted"
-```
-
-**Real example:**
-
-```
-Task: Screen 1000 biotech companies for FDA risk
-
-Option 1 (All Claude):
-  Cost: 1000 × $0.18 = $180
-  Time: 1000 × 2 min = 2000 min (33 hours!)
-  Quality: 96%
-
-Option 2 (Two-stage):
-  Stage 1 (GPT-4o-mini): 1000 × $0.008 = $8
-    → Filter to top 100 (95% recall)
-    Time: 1000 × 0.3 min = 300 min (5 hours)
-
-  Stage 2 (Claude): 100 × $0.18 = $18
-    → Deep dive on filtered list
-    Time: 100 × 2 min = 200 min (3.3 hours)
-
-  Total Cost: $26 (86% savings!)
-  Total Time: 8.3 hours (75% faster)
-  Quality: 96% on the 100 that matter!
-
-Winner: Option 2 (smarter, not harder)
-```
-
----
-
-### 3.2 Speed vs Quality
-
-**The Spectrum:**
-
-```
-Fast ←────────────────────→ Slow
-Low Quality              High Quality
-
-GPT-4o-mini  GPT-4o    Gemini   Claude
-200ms        400ms     600ms    800ms
-85% quality  92%       90%      96%
-```
-
-**Decision framework:**
-
-```python
-def choose_model_by_deadline(deadline_minutes, min_quality):
-    options = [
-        ("gpt-4o-mini", 200, 85),  # (model, latency_ms, quality%)
-        ("gpt-4o", 400, 92),
-        ("gemini", 600, 90),
-        ("claude", 800, 96),
-    ]
-
-    # Filter by quality requirement
-    viable = [o for o in options if o[2] >= min_quality]
-
-    # Choose fastest that meets quality bar
-    return min(viable, key=lambda x: x[1])[0]
-
-# Examples:
-choose_model_by_deadline(deadline=5, min_quality=80)
-# → gpt-4o-mini (fast enough, meets quality)
-
-choose_model_by_deadline(deadline=60, min_quality=95)
-# → claude (have time, need quality)
-```
-
-**Real example:**
-
-```
-Scenario: Live earnings call, PM wants quick take
-
-Without optimization:
-  Use Claude (96% quality)
-  Wait: 60 seconds for analysis
-  PM: "Too late, call already moved on"
-
-With optimization:
-  Use GPT-4o-mini (85% quality)
-  Wait: 15 seconds
-  PM: "Good enough, let's discuss"
-
-Trade-off: 96% → 85% quality
-Benefit: Actually useful in real-time!
-```
-
----
-
-### 3.3 Cost vs Speed (The Big Trade-Off)
-
-**Four quadrants:**
-
-```
-        Cheap
-          │
-          │   Q1: Cheap & Fast          Q2: Expensive & Fast
-          │   (Best for volume)         (Best for urgent + quality)
-          │   • GPT-4o-mini             • GPT-4o + parallel
-          │   • Parallel execution      • Streaming
-Fast ─────┼──────────────────────────────────────────── Slow
-          │   Q3: Cheap & Slow          Q4: Expensive & Slow
-          │   (Best for batch)          (Worst - avoid!)
-          │   • GLM self-hosted         • Claude sequential
-          │   • Overnight jobs
-          │
-      Expensive
-```
-
-**Strategic choices:**
-
-```python
-class StrategicRAG:
-    def analyze_portfolio(self, companies, deadline_hours, budget_usd):
-        if deadline_hours < 1 and budget_usd > 50:
-            # Q2: Urgent + have budget
-            return self.fast_expensive(companies)
-            # Strategy: GPT-4o + parallel + streaming
-            # Cost: $50
-            # Time: 15 min
-
-        elif deadline_hours < 1 and budget_usd < 50:
-            # Q1: Urgent + tight budget
-            return self.fast_cheap(companies)
-            # Strategy: GPT-4o-mini + parallel
-            # Cost: $10
-            # Time: 20 min
-            # Trade-off: Lower quality
-
-        elif deadline_hours > 24 and budget_usd < 50:
-            # Q3: Batch job + tight budget
-            return self.slow_cheap(companies)
-            # Strategy: GLM self-hosted + overnight
-            # Cost: $5 (GPU cost)
-            # Time: 24 hours
-            # Trade-off: Slow but cheap
-
-        else:
-            # Q4: Avoid this quadrant!
-            # If slow, should be cheap
-            # If expensive, should be fast
-            raise ValueError("Bad trade-off!")
-```
-
----
-
-## Part 4: Real-World Case Studies
-
-### Case Study 1: Biotech FDA Screening
-
-**Requirements:**
-- Analyze 50 biotech companies
-- Deadline: 4 hours
-- Budget: $50
-- Quality: Need 90%+ accuracy
-
-**Optimization strategy:**
-
-```python
-# Stage 1: Quick filter (GPT-4o-mini)
-candidates = await parallel_analyze(
-    companies=all_50,
-    model="gpt-4o-mini",
-    batch_size=10
-)
-# Cost: 50 × $0.008 = $0.40
-# Time: 5 batches × 2 min = 10 min
-# Output: 15 high-potential companies
-
-# Stage 2: Deep dive (Claude)
-final_analysis = await parallel_analyze(
-    companies=top_15,
-    model="claude",
-    batch_size=5
-)
-# Cost: 15 × $0.18 = $2.70
-# Time: 3 batches × 3 min = 9 min
-
-# Stage 3: Synthesis (GPT-4o)
-report = await synthesize(
-    analyses=final_analysis,
-    model="gpt-4o"
-)
-# Cost: $0.50
-# Time: 5 min
-
-# Total: $3.60, 24 minutes
-# Under budget: ✓ ($50)
-# Under deadline: ✓ (4 hours)
-# Quality: 96% on top 15 (what matters)
-```
-
----
-
-### Case Study 2: Real-Time Earnings Monitoring
-
-**Requirements:**
-- Monitor 20 companies during earnings season
-- Deadline: < 5 minutes per company
-- Budget: $100/day
-- Quality: Good enough for initial take
-
-**Optimization strategy:**
-
-```python
-class EarningsMonitor:
-    def __init__(self):
-        self.cache = FileStateCache(100, 25)
-
-    async def quick_analysis(self, company):
-        # Check cache first (instant!)
-        cached = self.cache.get(f"{company}_earning")
-        if cached and self.is_recent(cached, hours=4):
-            return cached  # 0ms, $0
-
-        # Use fast model (GPT-4o-mini)
-        result = await analyze_streaming(
-            company=company,
-            model="gpt-4o-mini"  # 200ms latency
-        )
-
-        self.cache.set(f"{company}_earning", result)
-        return result
-
-# Cost per company: $0.008
-# Time per company: 15 seconds
-# Quality: 85% (good enough for screening)
-# Daily cost: 20 × $0.008 × 4 (4 times/day) = $0.64
-
-# Well under budget! Can even upgrade to GPT-4o:
-# Daily cost: 20 × $0.12 × 4 = $9.60 (still under $100)
-```
-
----
-
-## Part 5: Interview Talking Points
-
-### Question: "How would you optimize costs for analyzing 1000 10-Ks?"
-
-**Good answer:**
-
-"I'd use a three-tier strategy:
-
-**Tier 1 - Cheap Filter (GPT-4o-mini)**
-- Analyze all 1000 companies
-- Cost: 1000 × $0.008 = $8
-- Time: ~2 hours (parallel batches)
-- Goal: Filter to top 100 (10%)
-
-**Tier 2 - Quality Screen (GPT-4o)**
-- Deep dive on 100 candidates
-- Cost: 100 × $0.12 = $12
-- Time: ~30 minutes
-- Goal: Filter to top 20 (2%)
-
-**Tier 3 - Final Analysis (Claude)**
-- Investment-grade analysis on 20 finalists
-- Cost: 20 × $0.18 = $3.60
-- Time: ~10 minutes
-- Goal: Final recommendations
-
-**Total: $23.60, 2.5 hours**
-vs naive Claude-only: $180, 33 hours
-
-**That's 87% cost savings and 13x faster!**
-
-The key insight: Use cheaper models for filtering, expensive models only where quality matters."
-
----
-
-### Question: "How would you reduce latency for a live dashboard?"
-
-**Good answer:**
-
-"I'd implement a five-layer strategy:
-
-**1. Aggressive caching (L1: Memory, L2: Redis)**
-- Most queries hit cache (< 5ms)
-- Only cache misses call LLM
-
-**2. Parallel execution**
-- Analyze 10 companies simultaneously
-- Time = max(individual) not sum(all)
-
-**3. Streaming responses**
-- User sees first results in 0.5s
-- Perceived latency <<< actual latency
-
-**4. Smart model selection**
-- Real-time queries: GPT-4o-mini (200ms)
-- Background jobs: Claude (800ms, better quality)
-
-**5. Pre-computation**
-- Analyze all S&P 500 overnight
-- Dashboard queries = cache hits (instant!)
-
-**Result:**
-- P50 latency: 5ms (cache hit)
-- P95 latency: 300ms (cache miss + GPT-4o-mini)
-- P99 latency: 1000ms (cache miss + Claude)
-
-Much better than naive 2000ms average!"
-
----
-
-### Question: "What's the trade-off between cost and quality?"
-
-**Good answer:**
-
-"It's not binary - it's a spectrum with task-dependent optima:
-
-**For $100M investment decision:**
-- Use Claude ($0.18/analysis)
-- Cost is irrelevant compared to decision value
-- 96% quality worth 10x cost vs cheaper model
-
-**For screening 1000 companies:**
-- Use GPT-4o-mini ($0.008/analysis)
-- Total cost $8 vs $180 for Claude
-- 85% quality good enough for filtering
-- False negatives caught in next stage
-
-**The framework:**
-```
-Decision Value / Analysis Cost = Quality Premium Worth
-```
-
-**Examples:**
-- $100M decision / $0.18 = $555M per $1 → Quality matters!
-- $0 decision / $0.18 = $0 per $1 → Cost matters!
-
-**My rule:**
-- Decision value > 1000× cost: Use best model (Claude)
-- Decision value < 100× cost: Use cheap model (GPT-4o-mini)
-- In between: Use balanced model (GPT-4o)
-
-This gives optimal quality-adjusted ROI."
-
----
-
-## Summary: Key Numbers to Remember
-
-### Cost Metrics
-- **Prompt caching**: 88% savings on repetitive prompts
-- **Fork agents**: 90% savings on parallel tasks
-- **Two-stage pipeline**: 86% savings on screening tasks
-- **LRU cache**: 67% savings on repeated reads
-
-### Latency Metrics
-- **Parallel execution**: 50x faster (50 companies: 150min → 3min)
-- **Streaming**: 180x perceived speedup (TTFB: 90s → 0.5s)
-- **Cache hits**: ∞ faster (2000ms → 0ms)
-- **Model choice**: 4x faster (Claude 800ms → GPT-4o-mini 200ms)
-
-### Trade-Off Framework
-```
-High Stakes + Have Budget → Claude (96% quality, $9/1M)
-Production Balance → GPT-4o (92% quality, $6.25/1M)
-High Volume + Tight Budget → GPT-4o-mini (85% quality, $0.38/1M)
-Very High Volume → GLM self-hosted (75% quality, $0 API)
-```
-
-### Decision Formula
-```
-If (decision_value / cost) > 1000: Use best quality
-If (decision_value / cost) < 100: Use lowest cost
-Else: Use balanced option
-```
-
+This would replace all the "estimated" numbers in this document with measured ones, and give the `ModelBenchmark` framework real data to report on.
