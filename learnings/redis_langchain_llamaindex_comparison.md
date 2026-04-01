@@ -72,19 +72,19 @@ r.hset('company:AAPL', mapping={
 
 ### What Redis Does NOT Do
 
-❌ Document chunking
-❌ Embedding generation
-❌ Vector similarity search (well, it has vector search but not primary use)
-❌ LLM orchestration
-❌ RAG pipeline management
+- ❌ Document chunking
+- ❌ Embedding generation
+- ❌ Vector similarity search (well, it has vector search but not primary use)
+- ❌ LLM orchestration
+- ❌ RAG pipeline management
 
 ### What Redis IS Good For
 
-✅ Fast caching (sub-millisecond reads)
-✅ Distributed (multiple servers can share cache)
-✅ Team-wide sharing (analyst A's work cached for analyst B)
-✅ Persistence (can save to disk, survive restarts)
-✅ Pub/Sub (real-time updates across team)
+- ✅ Fast caching (sub-millisecond reads)
+- ✅ Distributed (multiple servers can share cache)
+- ✅ Team-wide sharing (analyst A's work cached for analyst B)
+- ✅ Persistence (can save to disk, survive restarts)
+- ✅ Pub/Sub (real-time updates across team)
 
 ---
 
